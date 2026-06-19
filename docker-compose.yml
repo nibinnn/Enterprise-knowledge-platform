@@ -1,0 +1,141 @@
+version: "3.9"
+
+# =============================================================================
+# Enterprise Knowledge Intelligence Platform — Docker Compose
+# =============================================================================
+# Services:
+#   api       — FastAPI application
+#   worker    — Celery worker for async ingestion
+#   postgres  — Primary relational store
+#   redis     — Celery broker + embedding cache
+#   qdrant    — Vector database
+# =============================================================================
+
+x-common-env: &common-env
+  APP_ENV: ${APP_ENV:-development}
+  SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ekip_user}:${POSTGRES_PASSWORD:-ekip_pass}@postgres:5432/${POSTGRES_DB:-ekip}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  QDRANT_HOST: qdrant
+  QDRANT_PORT: 6333
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  COHERE_API_KEY: ${COHERE_API_KEY:-}
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+  LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+
+services:
+
+  # ── API (FastAPI) ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: api
+    container_name: ekip_api
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+    volumes:
+      - ./uploads:/app/uploads       # persisted file uploads
+      - .:/app                       # live-reload in dev (remove in prod)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Celery Worker ─────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+    container_name: ekip_worker
+    environment:
+      <<: *common-env
+    volumes:
+      - ./uploads:/app/uploads
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    restart: unless-stopped
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ekip_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ekip}
+      POSTGRES_USER: ${POSTGRES_USER:-ekip_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ekip_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./app/db/init.sql:/docker-entrypoint-initdb.d/init.sql  # auto-runs on first boot
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ekip_user} -d ${POSTGRES_DB:-ekip}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ekip_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ── Qdrant (Vector Database) ───────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.9.3
+    container_name: ekip_qdrant
+    ports:
+      - "6333:6333"      # HTTP API
+      - "6334:6334"      # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    restart: unless-stopped
+    # No built-in healthcheck in the official image; poll the REST API
+    # healthcheck: test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+
+networks:
+  default:
+    name: ekip_network
