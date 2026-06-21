@@ -18,6 +18,7 @@ from typing import Any, Dict
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
@@ -97,6 +98,7 @@ app = FastAPI(
 )
 
 # CORS
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if settings.app_debug else [],
@@ -105,9 +107,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Error handlers ────────────────────────────────────────────────────────────
+from app.api.errors import register_handlers
+register_handlers(app)
 
-# ── Health endpoints ──────────────────────────────────────────────────────────
+# ── Routers ───────────────────────────────────────────────────────────────────
+from app.api.routes import auth, documents, search, ask, feedback, admin
 
+PREFIX = "/api/v1"
+app.include_router(auth.router,      prefix=PREFIX)
+app.include_router(documents.router, prefix=PREFIX)
+app.include_router(search.router,    prefix=PREFIX)
+app.include_router(ask.router,       prefix=PREFIX)
+app.include_router(feedback.router,  prefix=PREFIX)
+app.include_router(admin.router,     prefix=PREFIX)
+
+
+# ── Ops endpoints ─────────────────────────────────────────────────────────────
 @app.get("/health", tags=["ops"])
 async def health() -> Dict[str, Any]:
     """Liveness probe — returns 200 if the process is alive."""
@@ -138,12 +154,3 @@ async def ready() -> JSONResponse:
         status_code=status_code,
         content={"status": "ready" if all_ok else "degraded", "checks": checks},
     )
-
-
-# ── Routers (uncomment as each is built) ─────────────────────────────────────
-# from app.api.routes import documents, search, ask, feedback, eval
-# app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
-# app.include_router(search.router,    prefix="/api/v1/search",    tags=["search"])
-# app.include_router(ask.router,       prefix="/api/v1/ask",       tags=["ask"])
-# app.include_router(feedback.router,  prefix="/api/v1/feedback",  tags=["feedback"])
-# app.include_router(eval.router,      prefix="/api/v1/eval",      tags=["eval"])
