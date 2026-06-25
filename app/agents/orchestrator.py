@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.core.base.tool import ToolRegistry, ToolResult
+from app.core.tracing import get_tracer
 from app.config import get_settings
 
 logger   = logging.getLogger(__name__)
@@ -75,72 +76,107 @@ class AgentOrchestrator:
         self._max_iter = max_iter
 
     async def run(self, question: str, filters: Optional[Dict[str, Any]] = None) -> AgentResponse:
+        from app.core.metrics import (
+            AGENT_REQUESTS_TOTAL, AGENT_ITERATIONS, AGENT_TOOL_CALLS_TOTAL,
+        )
+        tracer   = get_tracer()
         t_start  = time.perf_counter()
         messages = [{"role": "user", "content": question}]
         steps:   List[AgentStep] = []
         tools    = self._registry.llm_schemas()
+        final_text = "I was unable to fully answer the question within the iteration limit."
 
-        for iteration in range(self._max_iter):
-            response = await self._call_llm(messages, tools)
-            stop_reason = response.stop_reason
+        async with tracer.trace("agent_run", input={"question": question}) as trace:
+            try:
+                for iteration in range(self._max_iter):
+                    async with trace.generation(
+                        f"llm_iteration_{iteration + 1}",
+                        model=settings.llm_model,
+                        prompt=f"[iteration {iteration + 1}] {question}",
+                    ) as gen:
+                        response    = await self._call_llm(messages, tools)
+                        stop_reason = response.stop_reason
+                        gen.end(completion=str(stop_reason))
 
-            # ── Text-only answer — we're done ─────────────────────────────────
-            if stop_reason == "end_turn":
-                final_text = self._extract_text(response)
-                break
+                    # ── Text-only answer — done ───────────────────────────────
+                    if stop_reason == "end_turn":
+                        final_text = self._extract_text(response)
+                        break
 
-            # ── Tool use ──────────────────────────────────────────────────────
-            if stop_reason == "tool_use":
-                tool_results_content = []
-                for block in response.content:
-                    if block.type != "tool_use":
+                    # ── Tool use ──────────────────────────────────────────────
+                    if stop_reason == "tool_use":
+                        tool_results_content = []
+                        for block in response.content:
+                            if block.type != "tool_use":
+                                continue
+                            tool_name  = block.name
+                            tool_input = block.input or {}
+                            tool_id    = block.id
+
+                            t_tool = time.perf_counter()
+                            tool_status = "success"
+                            async with trace.span(
+                                f"tool_{tool_name}",
+                                input={"tool": tool_name, "input": tool_input},
+                            ) as span:
+                                try:
+                                    tool   = self._registry.get(tool_name)
+                                    result: ToolResult = await tool.arun(**tool_input)
+                                    output = result.output
+                                    span.end(output={"success": result.success, "output_len": len(output)})
+                                except KeyError:
+                                    output      = f"Tool '{tool_name}' not found."
+                                    tool_status = "error"
+                                    span.end(status="error")
+                                except Exception as exc:
+                                    output      = f"Tool error: {exc}"
+                                    tool_status = "error"
+                                    span.end(status="error")
+
+                            tool_ms = (time.perf_counter() - t_tool) * 1000
+                            AGENT_TOOL_CALLS_TOTAL.labels(
+                                tool_name=tool_name, status=tool_status
+                            ).inc()
+
+                            steps.append(AgentStep(
+                                step=iteration + 1,
+                                tool_name=tool_name,
+                                tool_input=tool_input,
+                                tool_output=output[:1000],
+                                latency_ms=round(tool_ms, 1),
+                            ))
+                            logger.info(
+                                "[Agent] Step %d: %s → %d chars in %.0f ms trace_id=%s",
+                                iteration + 1, tool_name, len(output), tool_ms, trace.id,
+                            )
+
+                            tool_results_content.append({
+                                "type":        "tool_result",
+                                "tool_use_id": tool_id,
+                                "content":     output,
+                            })
+
+                        messages.append({"role": "assistant", "content": response.content})
+                        messages.append({"role": "user",      "content": tool_results_content})
                         continue
-                    tool_name  = block.name
-                    tool_input = block.input or {}
-                    tool_id    = block.id
 
-                    t_tool = time.perf_counter()
-                    try:
-                        tool = self._registry.get(tool_name)
-                        result: ToolResult = await tool.arun(**tool_input)
-                        output = result.output
-                    except KeyError:
-                        output = f"Tool '{tool_name}' not found."
-                    except Exception as exc:
-                        output = f"Tool error: {exc}"
-                    tool_ms = (time.perf_counter() - t_tool) * 1000
+                    final_text = self._extract_text(response)
+                    break
 
-                    steps.append(AgentStep(
-                        step=iteration + 1,
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        tool_output=output[:1000],
-                        latency_ms=round(tool_ms, 1),
-                    ))
-                    logger.info("[Agent] Step %d: %s → %d chars in %.0f ms",
-                                iteration + 1, tool_name, len(output), tool_ms)
+                total_ms = (time.perf_counter() - t_start) * 1000
+                AGENT_REQUESTS_TOTAL.labels(status="success").inc()
+                AGENT_ITERATIONS.observe(len(steps))
+                logger.info(
+                    "[Agent] Completed in %.0f ms, %d steps trace_id=%s",
+                    total_ms, len(steps), trace.id,
+                )
+                trace.end(output={"steps": len(steps), "answer_length": len(final_text)})
+                return AgentResponse(answer=final_text, steps=steps, total_ms=round(total_ms, 1))
 
-                    tool_results_content.append({
-                        "type":        "tool_result",
-                        "tool_use_id": tool_id,
-                        "content":     output,
-                    })
-
-                # Append assistant turn + tool results
-                messages.append({"role": "assistant", "content": response.content})
-                messages.append({"role": "user",      "content": tool_results_content})
-                continue
-
-            # ── Unexpected stop reason ─────────────────────────────────────────
-            final_text = self._extract_text(response)
-            break
-        else:
-            # Max iterations reached
-            final_text = "I was unable to fully answer the question within the iteration limit."
-
-        total_ms = (time.perf_counter() - t_start) * 1000
-        logger.info("[Agent] Completed in %.0f ms, %d steps", total_ms, len(steps))
-        return AgentResponse(answer=final_text, steps=steps, total_ms=round(total_ms, 1))
+            except Exception as exc:
+                AGENT_REQUESTS_TOTAL.labels(status="error").inc()
+                logger.error("[Agent] Failed: %s trace_id=%s", exc, trace.id)
+                raise
 
     # ── LLM call ──────────────────────────────────────────────────────────────
 

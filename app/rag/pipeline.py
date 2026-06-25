@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.core.models.document import Answer, Citation, QueryContext
+from app.core.tracing import get_tracer
 from app.rag.context_builder import ContextBuilder
 from app.rag.llm import LLMClient
 from app.config import get_settings
@@ -51,46 +52,87 @@ class RAGPipeline:
         top_k:    Optional[int] = None,
         rerank_top_n: Optional[int] = None,
     ) -> Answer:
+        from app.core.metrics import (
+            RAG_REQUESTS_TOTAL, RAG_RETRIEVAL_DURATION,
+            RAG_LLM_DURATION, RAG_CONTEXT_CHUNKS,
+        )
+        tracer  = get_tracer()
         t_start = time.perf_counter()
 
-        # 1. Retrieve + rerank
-        t_ret = time.perf_counter()
-        retriever = self._get_retriever()
-        chunks    = await retriever.retrieve(
-            query=question,
-            top_k=top_k or self._top_k,
-            filters=filters,
-        )
-        retrieval_ms = (time.perf_counter() - t_ret) * 1000
+        async with tracer.trace(
+            "rag_pipeline",
+            input={"question": question, "filters": filters},
+        ) as trace:
+            try:
+                # 1. Retrieve + rerank
+                async with trace.span("retrieval", input={"query": question, "top_k": top_k or self._top_k}):
+                    t_ret     = time.perf_counter()
+                    retriever = self._get_retriever()
+                    chunks    = await retriever.retrieve(
+                        query=question,
+                        top_k=top_k or self._top_k,
+                        filters=filters,
+                    )
+                    retrieval_ms = (time.perf_counter() - t_ret) * 1000
+                    RAG_RETRIEVAL_DURATION.observe(retrieval_ms / 1000)
 
-        # 2. Build context
-        ctx = self._context_builder.build(question, chunks[:rerank_top_n or self._rerank_top_n])
+                # 2. Build context
+                top_n = rerank_top_n or self._rerank_top_n
+                async with trace.span("context_build", input={"chunk_count": len(chunks), "top_n": top_n}) as s:
+                    ctx = self._context_builder.build(question, chunks[:top_n])
+                    RAG_CONTEXT_CHUNKS.observe(len(ctx.chunks))
+                    s.end(output={"context_tokens": ctx.total_tokens, "truncated": ctx.truncated})
 
-        # 3. Generate answer
-        t_llm = time.perf_counter()
-        answer_text = await self._llm.generate_answer(
-            question=question,
-            context=ctx.formatted_context,
-        )
-        llm_ms = (time.perf_counter() - t_llm) * 1000
+                # 3. Generate answer
+                t_llm  = time.perf_counter()
+                prompt = (
+                    f"<sources>\n{ctx.formatted_context}\n</sources>\n\n"
+                    f"Question: {question}\n\nAnswer (cite sources with [N]):"
+                )
+                async with trace.generation(
+                    "llm_generate",
+                    model=self._llm._model,
+                    prompt=prompt,
+                ) as gen:
+                    answer_text = await self._llm.generate_answer(
+                        question=question,
+                        context=ctx.formatted_context,
+                    )
+                    llm_ms = (time.perf_counter() - t_llm) * 1000
+                    RAG_LLM_DURATION.labels(
+                        provider=settings.llm_provider.value,
+                        model=self._llm._model,
+                    ).observe(llm_ms / 1000)
+                    gen.end(completion=answer_text)
 
-        # 4. Extract citations
-        citations = self._extract_citations(answer_text, ctx)
+                # 4. Extract citations
+                citations = self._extract_citations(answer_text, ctx)
 
-        total_ms = (time.perf_counter() - t_start) * 1000
-        logger.info("RAG complete in %.0f ms (retrieval=%.0f, llm=%.0f)", total_ms, retrieval_ms, llm_ms)
+                total_ms = (time.perf_counter() - t_start) * 1000
+                logger.info(
+                    "RAG complete in %.0f ms (retrieval=%.0f, llm=%.0f) trace_id=%s",
+                    total_ms, retrieval_ms, llm_ms, trace.id,
+                )
+                RAG_REQUESTS_TOTAL.labels(status="success").inc()
 
-        return Answer(
-            id=str(uuid.uuid4()),
-            query=question,
-            answer_text=answer_text,
-            citations=citations,
-            model_used=self._llm._model,
-            retrieval_latency_ms=round(retrieval_ms, 1),
-            llm_latency_ms=round(llm_ms, 1),
-            total_latency_ms=round(total_ms, 1),
-            created_at=datetime.utcnow(),
-        )
+                answer = Answer(
+                    id=str(uuid.uuid4()),
+                    query=question,
+                    answer_text=answer_text,
+                    citations=citations,
+                    model_used=self._llm._model,
+                    retrieval_latency_ms=round(retrieval_ms, 1),
+                    llm_latency_ms=round(llm_ms, 1),
+                    total_latency_ms=round(total_ms, 1),
+                    created_at=datetime.utcnow(),
+                )
+                trace.end(output={"answer_length": len(answer_text), "citation_count": len(citations)})
+                return answer
+
+            except Exception as exc:
+                RAG_REQUESTS_TOTAL.labels(status="error").inc()
+                logger.error("RAG pipeline failed: %s", exc)
+                raise
 
     async def stream(
         self,

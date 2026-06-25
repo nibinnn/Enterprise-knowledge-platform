@@ -17,6 +17,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from app.core.base.retriever import BaseRetriever
+from app.core.tracing import get_tracer
 from app.core.models.document import RetrievedChunk, SearchResult
 from app.config import get_settings
 
@@ -62,32 +63,48 @@ class HybridRetriever(BaseRetriever):
         if not query.strip():
             return []
 
-        # 1. Rewrite query
+        tracer     = get_tracer()
         query_text = await self.rewrite_query(query)
+        embedder   = self._get_embedder()
+        vs         = self._get_vector_store()
+        mode       = self._search_mode
 
-        # 2. Embed query
-        embedder  = self._get_embedder()
-        query_vec = await embedder.embed_query(query_text)
+        async with tracer.trace(
+            "retrieval",
+            input={"query": query_text, "top_k": top_k, "mode": mode},
+        ) as trace:
+            # Embed query
+            async with trace.span("embed_query"):
+                query_vec = await embedder.embed_query(query_text)
 
-        # 3. Search
-        vs = self._get_vector_store()
-        mode = self._search_mode
+            # Search
+            async with trace.span(
+                "vector_search",
+                input={"mode": mode, "top_k": top_k, "filters": filters},
+            ) as s:
+                if mode == "dense":
+                    raw = await vs.search(query_vec, top_k, filters)
+                elif mode == "keyword":
+                    raw = await vs.keyword_search(query_text, top_k, filters)
+                else:
+                    raw = await vs.hybrid_search(
+                        query_text, query_vec, top_k,
+                        self._dense_weight, self._keyword_weight, filters,
+                    )
+                s.end(output={"results": len(raw)})
 
-        if mode == "dense":
-            raw = await vs.search(query_vec, top_k, filters)
-        elif mode == "keyword":
-            raw = await vs.keyword_search(query_text, top_k, filters)
-        else:
-            raw = await vs.hybrid_search(
-                query_text, query_vec, top_k,
-                self._dense_weight, self._keyword_weight, filters,
-            )
+            retrieved = self._to_retrieved_chunks(raw)
 
-        retrieved = self._to_retrieved_chunks(raw)
+            # Rerank
+            async with trace.span(
+                "rerank",
+                input={"chunk_count": len(retrieved)},
+            ) as s:
+                reranker = self._get_reranker()
+                reranked = await reranker.rerank(query_text, retrieved, top_k)
+                s.end(output={"reranked": len(reranked)})
 
-        # 4. Rerank
-        reranker = self._get_reranker()
-        reranked = await reranker.rerank(query_text, retrieved, top_k)
+            trace.end(output={"final_chunks": len(reranked)})
 
         logger.info(
             "Retrieved %d chunks for query='%s…' (mode=%s)",

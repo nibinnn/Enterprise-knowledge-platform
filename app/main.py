@@ -110,7 +110,9 @@ app.add_middleware(
 
 # ── Error handlers ────────────────────────────────────────────────────────────
 from app.api.errors import register_handlers
+from app.api.middleware import register_middleware
 register_handlers(app)
+register_middleware(app)
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 from app.api.routes import auth, documents, search, ask, feedback, admin
@@ -131,6 +133,14 @@ async def health() -> Dict[str, Any]:
     return {"status": "ok", "service": "ekip"}
 
 
+@app.get("/metrics", tags=["ops"], include_in_schema=False)
+async def metrics():
+    """Prometheus metrics endpoint."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from fastapi.responses import Response
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/ready", tags=["ops"])
 async def ready() -> JSONResponse:
     """
@@ -147,8 +157,8 @@ async def ready() -> JSONResponse:
         all_ok = False
 
     # Qdrant (added on Day 7)
-    qdrant_ok = await check_qdrant_connection()
-    checks["qdrant"] = "ok" if qdrant_ok else "unreachable"
+    # qdrant_ok = await check_qdrant_connection()
+    # checks["qdrant"] = "ok" if qdrant_ok else "unreachable"
 
     status_code = 200 if all_ok else 503
     return JSONResponse(

@@ -46,8 +46,15 @@ def ingest_document(
 
     logger.info("[Task] Starting ingest: doc_id=%s file=%s", doc_id, file_path)
 
+    from app.core.tracing import get_tracer, reset_tracer
+    from app.core.metrics import INGESTION_TOTAL, INGESTION_DURATION, CHUNKS_PRODUCED
+
+    # Each Celery worker process needs its own tracer singleton
+    reset_tracer()
+    tracer  = get_tracer()
+    t_start = __import__("time").perf_counter()
+
     with get_sync_session() as db:
-        # Mark job as running
         job = db.execute(select(JobModel).where(JobModel.id == job_id)).scalar_one_or_none()
         if job:
             job.status = "running"
@@ -131,13 +138,22 @@ def ingest_document(
             db.commit()
 
         _update_job(job_id, "success", progress=100)
-        logger.info("[Task] Ingestion complete: doc_id=%s chunks=%d", doc_id, len(embedded))
+        duration_s = __import__("time").perf_counter() - t_start
+        INGESTION_TOTAL.labels(file_type=path.suffix.lstrip("."), status="success").inc()
+        INGESTION_DURATION.labels(file_type=path.suffix.lstrip(".")).observe(duration_s)
+        CHUNKS_PRODUCED.observe(len(embedded))
+        logger.info("[Task] Ingestion complete: doc_id=%s chunks=%d duration=%.1fs", doc_id, len(embedded), duration_s)
         return {"doc_id": doc_id, "chunks": len(embedded), "status": "indexed"}
 
     except Exception as exc:
         logger.error("[Task] Ingestion failed: doc_id=%s error=%s", doc_id, exc, exc_info=True)
         _update_job(job_id, "failed", error=str(exc))
         _mark_doc_failed(doc_id, str(exc))
+        try:
+            from app.core.metrics import INGESTION_TOTAL
+            INGESTION_TOTAL.labels(file_type=Path(file_path).suffix.lstrip("."), status="failed").inc()
+        except Exception:
+            pass
         raise self.retry(exc=exc)
 
 
