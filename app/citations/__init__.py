@@ -1,1 +1,2 @@
-# app/citations/__init__.py — implemented on future days
+from app.citations.engine import CitationEngine
+__all__ = ["CitationEngine"]

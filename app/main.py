@@ -40,6 +40,7 @@ structlog.configure(
     # wrapper_class=structlog.stdlib.BoundLogger,
     # logger_factory=structlog.PrintLoggerFactory(),
     processors=[
+        structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.dev.ConsoleRenderer()
         if settings.app_debug
@@ -146,8 +147,8 @@ async def ready() -> JSONResponse:
         all_ok = False
 
     # Qdrant (added on Day 7)
-    # qdrant_ok = await check_qdrant_connection()
-    # checks["qdrant"] = "ok" if qdrant_ok else "unreachable"
+    qdrant_ok = await check_qdrant_connection()
+    checks["qdrant"] = "ok" if qdrant_ok else "unreachable"
 
     status_code = 200 if all_ok else 503
     return JSONResponse(
