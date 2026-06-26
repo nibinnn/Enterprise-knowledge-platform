@@ -3,8 +3,7 @@ app/main.py
 ─────────────────────────────────────────────────────────────────────────────
 FastAPI application entry point.
 
-Routers are registered here as they are built on Days 21-22.
-For now, only the /health and /ready endpoints are live.
+Routers are registered here.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
