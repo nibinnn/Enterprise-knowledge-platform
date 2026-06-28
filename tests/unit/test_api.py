@@ -192,19 +192,20 @@ class TestSearchRoutes:
         assert resp.status_code == 401
 
     def test_search_returns_empty_results_stub(self, client, auth_headers):
-        with (
-            patch("app.api.routes.search.get_db", return_value=AsyncMock()),
-            patch("app.api.routes.search.get_search_service") as mock_dep,
-        ):
-            from app.api.schemas.search import SearchResponse
-            mock_svc = AsyncMock()
-            mock_svc.search = AsyncMock(return_value=SearchResponse(
-                query="test", results=[], total_results=0, mode="hybrid", latency_ms=1.0
+        from app.api.schemas.search import SearchResponse
+        from app.services.search import SearchService
+        from app.api.dependencies import get_search_service
+        async def _mock_svc():
+            svc = MagicMock(spec=SearchService)
+            svc.search = AsyncMock(return_value=SearchResponse(
+                query="machine learning", results=[], total_results=0, mode="hybrid", latency_ms=1.0
             ))
-            mock_dep.return_value = mock_svc
-            resp = client.post("/api/v1/search/",
-                               json={"query": "machine learning"},
-                               headers=auth_headers)
+            return svc
+        _app.dependency_overrides[get_search_service] = _mock_svc
+        resp = client.post("/api/v1/search/",
+                           json={"query": "machine learning"},
+                           headers=auth_headers)
+        _app.dependency_overrides.pop(get_search_service, None)
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True
@@ -240,23 +241,24 @@ class TestAskRoutes:
         assert resp.status_code == 401
 
     def test_ask_returns_stub_answer(self, client, auth_headers):
-        with (
-            patch("app.api.routes.ask.get_db", return_value=AsyncMock()),
-            patch("app.api.routes.ask.get_ask_service") as mock_dep,
-        ):
-            from app.api.schemas.ask import AskResponse
-            mock_svc = AsyncMock()
-            mock_svc.ask = AsyncMock(return_value=AskResponse(
+        from app.api.schemas.ask import AskResponse
+        from app.services.ask import AskService
+        from app.api.dependencies import get_ask_service
+        async def _mock_svc():
+            svc = MagicMock(spec=AskService)
+            svc.ask = AsyncMock(return_value=AskResponse(
                 answer_id=str(uuid.uuid4()),
                 question="What is AI?",
                 answer="Artificial Intelligence is...",
                 model_used="claude-sonnet-4-6",
                 created_at=datetime.utcnow(),
             ))
-            mock_dep.return_value = mock_svc
-            resp = client.post("/api/v1/ask/",
-                               json={"question": "What is AI?"},
-                               headers=auth_headers)
+            return svc
+        _app.dependency_overrides[get_ask_service] = _mock_svc
+        resp = client.post("/api/v1/ask/",
+                           json={"question": "What is AI?"},
+                           headers=auth_headers)
+        _app.dependency_overrides.pop(get_ask_service, None)
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is True

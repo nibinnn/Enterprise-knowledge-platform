@@ -1,6 +1,6 @@
 """
-app/services/ingestion.py  —  stub until Day 19 (Celery workers).
-Routes call this; the interface is stable.
+app/services/ingestion.py
+Document ingestion: creates DB records and dispatches the Celery ingest task.
 """
 from __future__ import annotations
 import uuid
@@ -23,19 +23,14 @@ class IngestionService:
         db,
     ) -> dict:
         """
-        Accept a file and queue it for async ingestion.
-        Returns doc_id + job_id immediately.
-
-        Stub: creates DB record and returns ids.
-        Real implementation (Day 19) dispatches a Celery task.
+        Accept a file, create DB records, and dispatch the async ingestion task.
+        Returns doc_id + job_id immediately; the Celery worker does the heavy lifting.
         """
-        from sqlalchemy import insert
         from app.db.models import DocumentModel, JobModel
 
         doc_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
 
-        # Insert document record
         doc = DocumentModel(
             id=doc_id,
             filename=original_filename,
@@ -51,7 +46,6 @@ class IngestionService:
         )
         db.add(doc)
 
-        # Insert job record
         job = JobModel(
             id=job_id,
             doc_id=doc_id,
@@ -61,8 +55,12 @@ class IngestionService:
         db.add(job)
         await db.flush()
 
-        # TODO (Day 19): dispatch Celery task
-        # celery_app.send_task("tasks.ingest_document", args=[doc_id, job_id, str(file_path)])
+        from app.workers.celery_app import celery_app
+        celery_app.send_task(
+            "tasks.ingest_document",
+            args=[doc_id, job_id, str(file_path)],
+            kwargs={"metadata": metadata},
+        )
 
         return {"document_id": doc_id, "job_id": job_id}
 
@@ -108,5 +106,9 @@ class IngestionService:
         await db.execute(
             delete(DocumentModel).where(DocumentModel.id == document_id)
         )
-        # TODO (Day 14): also delete from Qdrant
+
+        from app.vector_store.qdrant_store import QdrantVectorStore
+        vs = QdrantVectorStore()
+        await vs.delete_document(document_id)
+
         return True

@@ -220,6 +220,10 @@ class TestPDFParser:
     Tests for the PDFParser class.
     We mock `fitz.open` so these tests run without a real PDF file.
     """
+    pytestmark = pytest.mark.skipif(
+        __import__("importlib").util.find_spec("fitz") is None,
+        reason="PyMuPDF (fitz) not installed"
+    )
 
     def _make_mock_fitz(
         self,
