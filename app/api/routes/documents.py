@@ -199,42 +199,50 @@ async def delete_document(
     return None
 
 
-# ── Re-index ──────────────────────────────────────────────────────────────────
+# ── Retry / Re-index ──────────────────────────────────────────────────────────
 
 @router.post(
-    "/{document_id}/reindex",
-    response_model=APIResponse[DocumentStatusOut],
-    summary="Re-trigger ingestion for an existing document",
+    "/{document_id}/retry",
+    response_model=APIResponse[DocumentUploadResponse],
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Retry a failed or stuck ingestion job",
 )
-async def reindex_document(
+async def retry_ingestion(
     document_id:  str,
     current_user: CurrentUser = Depends(get_current_user),
     db:           AsyncSession = Depends(get_db),
     svc:          IngestionService = Depends(get_ingestion_service),
 ):
-    """Force re-ingestion of an already-uploaded document (e.g. after config changes)."""
+    """
+    Re-dispatch the Celery ingestion task for an existing document.
+    Use this when a job failed, got stuck in 'pending', or needs to be re-run
+    after a config change. Creates a new job record; the document_id is preserved.
+    """
     doc = await _get_or_404(document_id, db)
 
-    if not doc.file_path or not Path(doc.file_path).exists():
+    if doc.status == "running":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Original file no longer available for re-indexing.",
+            detail="Ingestion is already running for this document.",
         )
 
-    # Reset status and create new job
-    doc.status = "pending"
-    doc.error_message = None
+    try:
+        ids = await svc.retry_ingest(document_id, db)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
-    ids = await svc.ingest_file(
-        file_path=Path(doc.file_path),
-        original_filename=doc.original_filename,
-        file_type=doc.file_type,
-        metadata={},
-        db=db,
+    if not ids:
+        raise HTTPException(status_code=404, detail=f"Document '{document_id}' not found.")
+
+    return APIResponse(
+        data=DocumentUploadResponse(
+            document_id=ids["document_id"],
+            job_id=ids["job_id"],
+            filename=doc.original_filename,
+            file_type=doc.file_type,
+            message="Ingestion job re-queued.",
+        )
     )
-
-    result = await svc.get_status(document_id, db)
-    return APIResponse(data=DocumentStatusOut(**result))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -53,7 +53,7 @@ class IngestionService:
             status="pending",
         )
         db.add(job)
-        await db.flush()
+        await db.commit()  # must commit before worker process can read these rows
 
         from app.workers.celery_app import celery_app
         celery_app.send_task(
@@ -63,6 +63,49 @@ class IngestionService:
         )
 
         return {"document_id": doc_id, "job_id": job_id}
+
+    async def retry_ingest(self, document_id: str, db) -> Optional[dict]:
+        """Create a new job and re-dispatch the Celery task for an existing document."""
+        from app.db.models import DocumentModel, JobModel
+        from sqlalchemy import select
+
+        result = await db.execute(
+            select(DocumentModel).where(DocumentModel.id == document_id)
+        )
+        doc = result.scalar_one_or_none()
+        if not doc:
+            return None
+
+        if not doc.file_path or not Path(doc.file_path).exists():
+            raise FileNotFoundError("Original file no longer available for re-ingestion.")
+
+        job_id = str(uuid.uuid4())
+
+        doc.status = "pending"
+        doc.error_message = None
+
+        job = JobModel(
+            id=job_id,
+            doc_id=document_id,
+            job_type="ingest",
+            status="pending",
+        )
+        db.add(job)
+        await db.commit()
+
+        from app.workers.celery_app import celery_app
+        celery_app.send_task(
+            "tasks.ingest_document",
+            args=[document_id, job_id, doc.file_path],
+            kwargs={"metadata": {
+                "title": doc.title,
+                "department": doc.department,
+                "doc_category": doc.doc_category,
+                "tags": doc.tags or [],
+            }},
+        )
+
+        return {"document_id": document_id, "job_id": job_id}
 
     async def get_status(self, document_id: str, db) -> Optional[dict]:
         from sqlalchemy import select
