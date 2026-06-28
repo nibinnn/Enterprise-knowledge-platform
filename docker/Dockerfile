@@ -49,3 +49,13 @@ FROM base AS worker
 
 CMD ["celery", "-A", "app.workers.celery_app", "worker", \
      "--loglevel=info", "--concurrency=4"]
+
+
+# ── Stage 4: frontend (Streamlit) ─────────────────────────────────────────────
+FROM base AS frontend
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "frontend/app.py", \
+     "--server.port=8501", "--server.address=0.0.0.0", \
+     "--server.headless=true"]

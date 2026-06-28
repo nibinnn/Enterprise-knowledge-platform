@@ -59,6 +59,24 @@ services:
       timeout: 5s
       retries: 3
 
+  # ── Frontend (Streamlit) ──────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: frontend
+    container_name: ekip_frontend
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://api:8000/api/v1
+    volumes:
+      - .:/app
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ── Celery Worker ─────────────────────────────────────────────────────────────
   worker:
     build:
@@ -84,7 +102,7 @@ services:
     image: postgres:16-alpine
     container_name: ekip_postgres
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-ekip}
       POSTGRES_USER: ${POSTGRES_USER:-ekip_user}
